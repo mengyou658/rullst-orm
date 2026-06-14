@@ -19,6 +19,11 @@ tokio::task_local! {
 /// for the rare cases that need it (super-admin reads, cross-tenant
 /// reports, migrations) by calling `QueryBuilder::without_tenant()` on
 /// its builder before the query runs.
+///
+/// The tenant id is always passed to the database driver as a
+/// parameter binding (never interpolated as a SQL literal), so the
+/// same security guarantees that apply to every other `where_*`
+/// helper apply to the auto-injected tenant predicate as well.
 pub async fn with_tenant<T, F, R>(tenant_id: T, f: F) -> R
 where
     T: Into<RullstValue>,
@@ -140,131 +145,9 @@ mod cond_mentions_column_tests {
     }
 }
 
-/// Render a `RullstValue` as a SQL literal suitable for inline use
-/// inside a `WHERE <col> = <literal>` clause. The string variant
-/// escapes single quotes by doubling them (the standard SQL escape),
-/// which is sufficient to make the value safe for inline use. Numeric
-/// and boolean variants are rendered in their textual form.
-///
-/// This helper is `pub` so it can be called from macro-generated code
-/// and unit-tested independently of the query builder. It must stay
-/// in lock-step with the inline logic that the macro previously
-/// duplicated.
-pub fn render_tenant_literal(value: &RullstValue) -> String {
-    match value {
-        RullstValue::Int(i) => i.to_string(),
-        RullstValue::Float(f) => f.to_string(),
-        RullstValue::Bool(b) => {
-            if *b {
-                "1".to_string()
-            } else {
-                "0".to_string()
-            }
-        }
-        RullstValue::String(s) => {
-            // Escape any single quote by doubling it (the standard
-            // SQL string escape). Everything else passes through
-            // unchanged; this is safe because single-quoted SQL
-            // strings have no other special characters.
-            let mut out = String::with_capacity(s.len() + 2);
-            out.push('\'');
-            for ch in s.chars() {
-                if ch == '\'' {
-                    out.push('\'');
-                    out.push('\'');
-                } else {
-                    out.push(ch);
-                }
-            }
-            out.push('\'');
-            out
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── render_tenant_literal ─────────────────────────────────────────────
-
-    #[test]
-    fn render_int_literal() {
-        assert_eq!(render_tenant_literal(&RullstValue::Int(42)), "42");
-        assert_eq!(render_tenant_literal(&RullstValue::Int(-1)), "-1");
-    }
-
-    #[test]
-    fn render_float_literal() {
-        let rendered = render_tenant_literal(&RullstValue::Float(3.14));
-        // Rust's default Display for f64 is "3.14" — stable across
-        // platforms, no scientific notation for the values we feed
-        // in tests.
-        assert_eq!(rendered, "3.14");
-    }
-
-    #[test]
-    fn render_bool_literal() {
-        assert_eq!(render_tenant_literal(&RullstValue::Bool(true)), "1");
-        assert_eq!(render_tenant_literal(&RullstValue::Bool(false)), "0");
-    }
-
-    #[test]
-    fn render_string_literal_quotes_plain_text() {
-        assert_eq!(
-            render_tenant_literal(&RullstValue::String("acme".into())),
-            "'acme'"
-        );
-    }
-
-    #[test]
-    fn render_string_literal_escapes_single_quote() {
-        // SQL injection guard: a `'` in the tenant id must be doubled.
-        assert_eq!(
-            render_tenant_literal(&RullstValue::String("o'reilly".into())),
-            "'o''reilly'"
-        );
-    }
-
-    #[test]
-    fn render_string_literal_escapes_multiple_quotes() {
-        // Every `'` is doubled independently, no other escaping is
-        // applied (we trust the SQL parser to handle the rest of
-        // the UTF-8 range as plain data).
-        assert_eq!(
-            render_tenant_literal(&RullstValue::String("a'b'c".into())),
-            "'a''b''c'"
-        );
-    }
-
-    #[test]
-    fn render_string_literal_handles_empty_string() {
-        assert_eq!(
-            render_tenant_literal(&RullstValue::String(String::new())),
-            "''"
-        );
-    }
-
-    #[test]
-    fn render_string_literal_preserves_unicode() {
-        // Non-ASCII characters must pass through verbatim — the only
-        // special character in single-quoted SQL is `'` itself.
-        assert_eq!(
-            render_tenant_literal(&RullstValue::String("租户-α".into())),
-            "'租户-α'"
-        );
-    }
-
-    #[test]
-    fn render_string_literal_does_not_alter_backslash() {
-        // Standard SQL string literals only treat `''` as an escape
-        // sequence. A backslash must therefore be passed through
-        // unchanged (the SQL parser interprets it as a literal `\`).
-        assert_eq!(
-            render_tenant_literal(&RullstValue::String("a\\b".into())),
-            "'a\\b'"
-        );
-    }
 
     // ── with_tenant ───────────────────────────────────────────────────────
 

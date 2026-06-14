@@ -296,7 +296,7 @@ pub fn generate(
         }
 
         impl rullst_orm::schema::SubqueryBuilder for #builder_name {
-            fn to_sql(&self) -> String {
+            fn to_sql(&mut self) -> String {
                 self.to_sql()
             }
             fn bindings(&self) -> &Vec<rullst_orm::RullstValue> {
@@ -390,7 +390,7 @@ pub fn generate(
                 self
             }
 
-            pub fn where_exists<B: rullst_orm::schema::SubqueryBuilder>(mut self, subquery: B) -> Self {
+            pub fn where_exists<B: rullst_orm::schema::SubqueryBuilder>(mut self, mut subquery: B) -> Self {
                 let sql = subquery.to_sql();
                 self.wheres.push(("AND".to_string(), format!("EXISTS ({})", sql)));
                 for binding in subquery.bindings() {
@@ -399,7 +399,7 @@ pub fn generate(
                 self
             }
 
-            pub fn or_where_exists<B: rullst_orm::schema::SubqueryBuilder>(mut self, subquery: B) -> Self {
+            pub fn or_where_exists<B: rullst_orm::schema::SubqueryBuilder>(mut self, mut subquery: B) -> Self {
                 let sql = subquery.to_sql();
                 self.wheres.push(("OR".to_string(), format!("EXISTS ({})", sql)));
                 for binding in subquery.bindings() {
@@ -907,20 +907,20 @@ pub fn generate(
                     .any(|(_, cond)| rullst_orm::tenant::cond_mentions_column(cond, col))
             }
 
-            /// Inject the `WHERE <tenant_column> = <value>` clause unless
+            /// Inject the `WHERE <tenant_column> = ?` clause unless
             /// the caller has explicitly skipped it via
             /// `without_tenant()`, or has already pinned the tenant
             /// column to a value via their own `where_eq(...)` /
-            /// `where_in(...)` / etc. The tenant id is inlined as a
-            /// SQL literal (it originates from the verified login
-            /// user, never from external input), so we do not need
-            /// to bind it through the parameters vec.
-            ///
-            /// The actual SQL literal rendering is delegated to
-            /// `rullst_orm::tenant::render_tenant_literal` so the
-            /// escape rules live in a single, unit-tested helper
-            /// rather than being duplicated between the query and the
-            /// save path.
+            /// `where_in(...)` / etc. The tenant id is routed
+            /// through the native binding pipeline (`?` / `$N` on
+            /// Postgres via `format_postgres`) and pushed onto
+            /// `self.bindings` in lock-step with the `?` it appears
+            /// next to in the SQL, so the database driver — not
+            /// string interpolation — is the only thing that ever
+            /// sees the value. This is the same rule every other
+            /// `where_*` helper follows and is the only safe way to
+            /// surface a value coming from the ambient `with_tenant`
+            /// scope.
             ///
             /// Precedence (matches the documented behaviour in
             /// `docs/3-advanced-features.md`):
@@ -934,7 +934,7 @@ pub fn generate(
             /// Returns the updated `first_where` flag so the next push
             /// step (e.g. `push_soft_deletes`) can use the right
             /// conjunction.
-            fn push_tenant_filter(&self, sql: &mut String, first_where: bool) -> bool {
+            fn push_tenant_filter(&mut self, sql: &mut String, first_where: bool) -> bool {
                 if self.skip_tenant || self.tenant_column.is_none() {
                     // `skip_tenant` wins unconditionally — the
                     // caller has explicitly asked to bypass the
@@ -972,9 +972,14 @@ pub fn generate(
                     .expect("tenant_column is Some by the early return above");
                 sql.push('(');
                 sql.push_str(col);
-                sql.push_str(" = ");
-                sql.push_str(&rullst_orm::tenant::render_tenant_literal(&tenant));
+                sql.push_str(" = ?");
                 sql.push(')');
+                // Push the tenant id as a native binding. The order
+                // here matches the order in which `?` appears in
+                // the SQL (i.e. after the user wheres, which pushed
+                // their bindings onto `self.bindings` first via
+                // `where_eq` / `where_in` / etc.).
+                self.bindings.push(tenant);
                 first_where
             }
 
@@ -1043,7 +1048,16 @@ pub fn generate(
             }
 
             /// WARNING: This generates the raw SQL query. Ensure all dynamic table names and column names are validated.
-            pub fn to_sql(&self) -> String {
+            ///
+            /// `to_sql` takes `&mut self` because injecting the
+            /// tenant filter pushes a binding onto `self.bindings`
+            /// (see `push_tenant_filter`). The execution paths
+            /// (`get`, `delete_all`, `count`, `paginate`, …) all
+            /// already clone the builder before calling `to_sql`, so
+            /// this is invisible to end users — it only forces
+            /// internal call sites to either declare a `mut` local
+            /// or own the builder by value.
+            pub fn to_sql(&mut self) -> String {
                 let estimated_capacity = 50 + #table_name.len() + self.joins.iter().map(|j| j.len() + 1).sum::<usize>()
                     + self.wheres.iter().map(|(o, c)| o.len() + c.len() + 4).sum::<usize>();
                 let mut sql = String::with_capacity(estimated_capacity);
@@ -1056,7 +1070,10 @@ pub fn generate(
                 // soft-deletes so that its precedence is predictable
                 // (the first WHERE in the final SQL is whichever of
                 // these three — user wheres, tenant, soft-deletes —
-                // actually got added first).
+                // actually got added first). It also pushes the
+                // tenant id onto `self.bindings` so the value is
+                // passed to the driver as a parameter, never as a
+                // SQL literal.
                 let first_where = self.push_tenant_filter(&mut sql, first_where);
                 self.push_soft_deletes(&mut sql, first_where);
                 self.push_group_by(&mut sql);
@@ -1108,13 +1125,20 @@ fn generate_execution_methods(
                     if !self.errors.is_empty() {
                         return Err(self.errors[0].clone());
                     }
-                    let query_str = self.to_sql();
+                    // `to_sql` takes `&mut self` because the tenant
+                    // filter injection path pushes a binding onto
+                    // the builder. Clone first so the public
+                    // `&self` signature of `get` / `get_with_tx` is
+                    // unaffected — the same pattern `count`,
+                    // `paginate`, and `pluck_*` already use.
+                    let mut builder = self.clone();
+                    let query_str = builder.to_sql();
 
                     #[cfg(feature = "redis")]
                     {
                         if let Some(ttl) = self.remember_ttl {
                             use rullst_orm::_redis::AsyncCommands;
-                            let cache_key = format!("orm:cache:{}:{:?}", #table_name, (&query_str, &self.bindings));
+                            let cache_key = format!("orm:cache:{}:{:?}", #table_name, (&query_str, &builder.bindings));
                             let mut conn = rullst_orm::Orm::redis_manager()?;
                             if let Ok(cached_data) = conn.get::<_, String>(&cache_key).await {
                                 if !cached_data.is_empty() {
@@ -1129,11 +1153,11 @@ fn generate_execution_methods(
                     }
 
                     if rullst_orm::schema::is_query_log_enabled() {
-                        println!("[SQL Debug] {:?} | Bindings: {:?}", query_str, self.bindings);
+                        println!("[SQL Debug] {:?} | Bindings: {:?}", query_str, builder.bindings);
                     }
                     let mut results: Vec<#name> = {
                         let mut query = rullst_orm::_sqlx::query_as::<_, #name>(rullst_orm::_sqlx::AssertSqlSafe(query_str.as_str()));
-                        for binding in &self.bindings {
+                        for binding in &builder.bindings {
                             match binding {
                                 rullst_orm::RullstValue::String(s) => { query = query.bind(s.clone()); }
                                 rullst_orm::RullstValue::Int(i) => { query = query.bind(*i); }
@@ -1148,7 +1172,7 @@ fn generate_execution_methods(
                     {
                         if let Some(ttl) = self.remember_ttl {
                             use rullst_orm::_redis::AsyncCommands;
-                            let cache_key = format!("orm:cache:{}:{:?}", #table_name, (&query_str, &self.bindings));
+                            let cache_key = format!("orm:cache:{}:{:?}", #table_name, (&query_str, &builder.bindings));
                             let serialized = #name::to_cache_json_array(&results);
                             let mut conn = rullst_orm::Orm::redis_manager()?;
                             let _: Result<(), rullst_orm::_redis::RedisError> = conn.set_ex(&cache_key, serialized, ttl as u64).await;
@@ -1326,7 +1350,19 @@ fn generate_execution_methods(
                     // a separate local `first` for the
                     // "do I prepend `AND` to this clause?" decision
                     // inside the loop.
+                    //
+                    // The tenant value is passed via a `?` binding
+                    // (Postgres' `format_postgres` rewrites it to
+                    // `$N` below) and pushed onto a local `bindings`
+                    // vec in the exact position it appears in the
+                    // SQL — never interpolated as a literal. This
+                    // is the same rule `push_tenant_filter` follows
+                    // on the SELECT path; mirroring it on the
+                    // DELETE/UPDATE path keeps the safety story
+                    // consistent across every code path the ORM
+                    // generates.
                     let mut first_where_emitted = self.wheres.is_empty();
+                    let mut bindings: Vec<rullst_orm::RullstValue> = self.bindings.clone();
                     if !self.wheres.is_empty() {
                         query_str.push_str(" WHERE ");
                         let mut first = true;
@@ -1370,15 +1406,35 @@ fn generate_execution_methods(
                                 .expect("tenant_column is Some by the early return above");
                             query_str.push('(');
                             query_str.push_str(col);
-                            query_str.push_str(" = ");
-                            query_str.push_str(&rullst_orm::tenant::render_tenant_literal(&tenant));
+                            query_str.push_str(" = ?");
                             query_str.push(')');
+                            // Push the tenant id as a native
+                            // binding, in lock-step with the `?`
+                            // we just emitted.
+                            bindings.push(tenant);
                         }
                     }
 
+                    // Rewrite `?` placeholders as `$N` for Postgres.
+                    let query_str = if rullst_orm::Orm::driver() == "postgres" {
+                        let mut pg_sql = String::with_capacity(query_str.len());
+                        let mut param_idx = 1;
+                        for c in query_str.chars() {
+                            if c == '?' {
+                                pg_sql.push_str(&format!("${}", param_idx));
+                                param_idx += 1;
+                            } else {
+                                pg_sql.push(c);
+                            }
+                        }
+                        pg_sql
+                    } else {
+                        query_str
+                    };
+
                     let result = {
                         let mut query = rullst_orm::_sqlx::query(rullst_orm::_sqlx::AssertSqlSafe(query_str.as_str()));
-                        for binding in &self.bindings {
+                        for binding in &bindings {
                             match binding {
                                 rullst_orm::RullstValue::String(s) => { query = query.bind(s.clone()); }
                                 rullst_orm::RullstValue::Int(i) => { query = query.bind(*i); }

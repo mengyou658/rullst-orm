@@ -64,7 +64,7 @@ pub use database::RullstDatabase;
 pub use resource::{ApiResource, JsonResource, ResourceCollection};
 pub use rullst_orm_macros::Orm;
 pub use scout::{SearchEngine, get_search_engine, set_search_engine};
-pub use tenant::{cond_mentions_column, get_tenant_id, render_tenant_literal, with_tenant};
+pub use tenant::{cond_mentions_column, get_tenant_id, with_tenant};
 pub use types::Json;
 
 // Re-export async_trait so the macro can use it implicitly

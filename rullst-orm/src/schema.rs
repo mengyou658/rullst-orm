@@ -678,7 +678,14 @@ impl JoinClause {
 }
 
 pub trait SubqueryBuilder {
-    fn to_sql(&self) -> String;
+    /// Renders the subquery as SQL and pushes any bindings it
+    /// needs onto its own `bindings` vec. Takes `&mut self`
+    /// because the tenant filter injection path pushes a binding
+    /// during SQL construction (see `push_tenant_filter` in the
+    /// macro). The owner of the subquery is expected to clone
+    /// before passing it in, mirroring the rest of the builder
+    /// API.
+    fn to_sql(&mut self) -> String;
     fn bindings(&self) -> &Vec<crate::RullstValue>;
 }
 
